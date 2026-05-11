@@ -24,6 +24,9 @@ class BMC_Integration {
 	/** @var BMC_Integration|null */
 	private static $instance = null;
 
+	/** @var array Debug info collected during request — returned in JSON on failure */
+	private $debug = array();
+
 	/** @return self */
 	public static function instance() {
 		if ( null === self::$instance ) {
@@ -176,7 +179,10 @@ class BMC_Integration {
 		$order_id = $this->process_wc_checkout();
 
 		if ( is_wp_error( $order_id ) ) {
-			wp_send_json_error( array( 'message' => $order_id->get_error_message() ) );
+			wp_send_json_error( array(
+				'message' => $order_id->get_error_message(),
+				'debug'   => $this->debug,
+			) );
 		}
 		if ( ! $order_id ) {
 			wp_send_json_error( array( 'message' => __( 'Could not create order. Please try again.', 'breeze-modal-checkout' ) ) );
@@ -199,68 +205,75 @@ class BMC_Integration {
 			wp_send_json_error( array( 'message' => $payment_page->get_error_message() ) );
 		}
 
+		// Save payment page ID using HPOS-compatible method.
+		// WC 7.1+ may use custom order tables (HPOS) instead of wp_postmeta,
+		// so we must use the order object API, not direct DB writes to wp_postmeta.
+		if ( ! empty( $payment_page['id'] ) ) {
+			$save_order = wc_get_order( $order_id );
+			if ( $save_order ) {
+				$save_order->update_meta_data( '_breeze_payment_page_id', sanitize_text_field( $payment_page['id'] ) );
+				$save_order->update_meta_data( '_breeze_payment_page_url', esc_url_raw( $payment_page['url'] ) );
+				$save_order->save();
+
+				// Verify save worked
+				$verify_order = wc_get_order( $order_id );
+				$saved_id     = $verify_order ? $verify_order->get_meta( '_breeze_payment_page_id', true ) : null;
+			} else {
+				$saved_id = null;
+			}
+		} else {
+			$saved_id = null;
+		}
+
 		wp_send_json_success( array(
-			'paymentUrl' => $payment_page['url'],
-			'orderId'    => $order_id,
+			'paymentUrl'    => $payment_page['url'],
+			'orderId'       => $order_id,
+			'debug_page_id' => isset( $payment_page['id'] ) ? $payment_page['id'] : 'NOT SET',
+			'debug_saved'   => $saved_id,
 		) );
 	}
 
-	// ── WC checkout processing (legacy only) ──────────────────────────────────
-
-	/** @return int|WP_Error */
 	private function process_wc_checkout() {
-		$captured_order_id = 0;
-		$captured_error    = null;
+		// Validate nonce
+		$nonce = isset( $_POST['woocommerce-process-checkout-nonce'] )
+			? sanitize_text_field( wp_unslash( $_POST['woocommerce-process-checkout-nonce'] ) )
+			: '';
 
-		$intercept = function ( $result ) use ( &$captured_order_id ) {
-			if ( isset( $result['order_id'] ) ) {
-				$captured_order_id = (int) $result['order_id'];
-			}
-			return $result;
-		};
-		add_filter( 'woocommerce_payment_successful_result', $intercept, PHP_INT_MAX );
-
-		$error_intercept = function ( $message ) use ( &$captured_error ) {
-			$captured_error = $message;
-		};
-		add_action( 'woocommerce_checkout_order_exception', $error_intercept );
-
-		if ( ! isset( $_POST['woocommerce-process-checkout-nonce'] ) ) {
-			$_POST['woocommerce-process-checkout-nonce'] = wp_create_nonce( 'woocommerce-process_checkout' );
+		if ( ! wp_verify_nonce( $nonce, 'woocommerce-process_checkout' ) ) {
+			return new WP_Error(
+				'invalid_nonce',
+				__( 'We were unable to process your order, please try again.', 'breeze-modal-checkout' )
+			);
 		}
 
-		ob_start();
+		if ( WC()->cart->is_empty() ) {
+			return new WP_Error( 'empty_cart', __( 'Your cart is empty.', 'breeze-modal-checkout' ) );
+		}
+
+		$checkout    = WC()->checkout();
+		$posted_data = $checkout->get_posted_data();
+
+		// Create order using the only reliably public WC_Checkout method.
+		// create_order() handles field validation, customer data, and order
+		// creation internally without calling wp_send_json or exit().
 		try {
-			WC()->checkout()->process_checkout();
+			$order_id = $checkout->create_order( $posted_data );
 		} catch ( Exception $e ) {
-			ob_end_clean();
-			remove_filter( 'woocommerce_payment_successful_result', $intercept, PHP_INT_MAX );
-			return new WP_Error( 'checkout_exception', $e->getMessage() );
-		}
-		ob_end_clean();
-
-		remove_filter( 'woocommerce_payment_successful_result', $intercept, PHP_INT_MAX );
-		remove_action( 'woocommerce_checkout_order_exception', $error_intercept );
-
-		if ( $captured_error ) {
-			return new WP_Error( 'checkout_error', wp_strip_all_tags( $captured_error ) );
+			return new WP_Error( 'order_create_failed', $e->getMessage() );
 		}
 
-		$notices = wc_get_notices( 'error' );
-		if ( ! empty( $notices ) ) {
-			$messages = array();
-			foreach ( $notices as $n ) {
-				$messages[] = wp_strip_all_tags( is_array( $n ) ? ( isset( $n['notice'] ) ? $n['notice'] : '' ) : $n );
-			}
-			wc_clear_notices();
-			return new WP_Error( 'checkout_validation', implode( ' ', array_filter( $messages ) ) );
+		if ( is_wp_error( $order_id ) ) {
+			return $order_id;
 		}
 
-		if ( ! $captured_order_id ) {
-			return new WP_Error( 'no_order', __( 'Order could not be created.', 'breeze-modal-checkout' ) );
+		if ( ! $order_id ) {
+			return new WP_Error( 'no_order', __( 'Order could not be created. Please try again.', 'breeze-modal-checkout' ) );
 		}
 
-		return $captured_order_id;
+		$order = wc_get_order( $order_id );
+		do_action( 'woocommerce_checkout_order_created', $order );
+
+		return $order_id;
 	}
 
 	// ── Breeze API: create payment page (legacy only) ─────────────────────────
@@ -296,12 +309,8 @@ class BMC_Integration {
 			return new WP_Error( 'breeze_no_url', __( 'Breeze did not return a payment URL.', 'breeze-modal-checkout' ) );
 		}
 
-		if ( ! empty( $payment_page['id'] ) ) {
-			$order->update_meta_data( '_breeze_payment_page_id', $payment_page['id'] );
-		}
-		$order->update_status( 'pending', __( 'Awaiting Breeze payment (modal flow).', 'breeze-modal-checkout' ) );
-		$order->save();
-
+		// Meta saving is handled in ajax_create_payment() after this returns,
+		// using HPOS-compatible order API. No saving here.
 		return $payment_page;
 	}
 

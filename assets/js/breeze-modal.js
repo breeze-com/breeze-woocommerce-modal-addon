@@ -74,24 +74,46 @@
 	   Intercept WooCommerce checkout submission
 	───────────────────────────────────────────── */
 	function bindCheckoutHook() {
-		// WooCommerce fires this filter before submitting for the selected gateway.
-		// Returning false cancels the default submission and hands control to us.
+		// Primary: WooCommerce fires this event before submitting for the selected gateway.
+		// Returning false cancels the default WC submission.
 		$( document.body ).on(
 			'checkout_place_order_' + GATEWAY_ID,
 			function () {
 				handlePlaceOrder();
-				return false; // prevent default WC form submit
+				return false;
 			}
 		);
 
-		// Also handle the case where the form is submitted directly
-		// (e.g. keyboard Enter) while Breeze is selected.
-		$( document ).on( 'submit', 'form.checkout', function ( e ) {
-			const selected = $( '#payment_method_' + GATEWAY_ID );
+		// Secondary: intercept the raw form submit as a fallback.
+		// Some themes or plugins replace wc-checkout.js entirely, meaning the
+		// checkout_place_order_ event never fires. Catching submit directly ensures
+		// we always intercept regardless of the JS stack.
+		// Using highest priority (capture phase) so we run before any other handler.
+		var checkoutForm = document.querySelector( 'form.checkout' );
+		if ( checkoutForm ) {
+			checkoutForm.addEventListener( 'submit', function ( e ) {
+				var selected = document.getElementById( 'payment_method_' + GATEWAY_ID );
+				if ( selected && selected.checked ) {
+					e.preventDefault();
+					e.stopImmediatePropagation();
+					handlePlaceOrder();
+				}
+			}, true ); // true = capture phase, runs before jQuery handlers
+		}
+
+		// Also watch for Place Order button clicks directly —
+		// catches cases where the button triggers JS rather than form submit.
+		$( document ).on( 'click', '#place_order', function ( e ) {
+			var selected = $( '#payment_method_' + GATEWAY_ID );
 			if ( selected.length && selected.is( ':checked' ) ) {
-				e.preventDefault();
-				e.stopImmediatePropagation();
-				handlePlaceOrder();
+				// Let WC do its validation first — if it passes it will fire
+				// checkout_place_order_ which we already handle above.
+				// Only intercept here if wc-checkout isn't present.
+				if ( typeof wc_checkout_params === 'undefined' ) {
+					e.preventDefault();
+					e.stopImmediatePropagation();
+					handlePlaceOrder();
+				}
 			}
 		} );
 	}
@@ -108,7 +130,29 @@
 
 		showLoadingState( true );
 
-		const formData = $( 'form.checkout' ).serialize();
+		var formData = $( 'form.checkout' ).serialize();
+
+		// Fix _wp_http_referer — WC uses this in nonce context verification.
+		// The form serializes it as /?wc-ajax=update_order_review (the last AJAX
+		// call) but WC expects it to be the checkout page URL.
+		var checkoutPath = window.breezeModalData.checkoutUrl
+			? new URL( window.breezeModalData.checkoutUrl ).pathname
+			: '/checkout/';
+		formData = formData.replace(
+			/_wp_http_referer=[^&]*/,
+			'_wp_http_referer=' + encodeURIComponent( checkoutPath )
+		);
+
+		// Ensure terms field is present — WC rejects if terms checkbox exists but
+		// isn't serialized (unchecked checkboxes are omitted by serialize()).
+		if ( $( 'input[name="terms"]' ).length && formData.indexOf( 'terms=' ) === -1 ) {
+			formData += '&terms=1&terms-field=1';
+		}
+
+		// Ensure ship_to_different_address is present
+		if ( formData.indexOf( 'ship_to_different_address' ) === -1 ) {
+			formData += '&ship_to_different_address=0';
+		}
 
 		$.ajax( {
 			url     : window.breezeModalData.ajaxUrl,
@@ -123,6 +167,17 @@
 				showLoadingState( false );
 
 				if ( ! response.success ) {
+					// Log full debug info to console
+					if ( response.data && response.data.debug ) {
+						console.group( '[Breeze Modal Addon] Checkout failure debug' );
+						console.log( 'captured_order_id:', response.data.debug.captured_order_id );
+						console.log( 'nonce_valid:', response.data.debug.nonce_valid );
+						console.log( 'buffered_output:', response.data.debug.buffered_output );
+						console.log( 'wc_notices:', response.data.debug.wc_notices );
+						console.log( 'post_keys:', response.data.debug.post_keys );
+						console.log( 'session_id:', response.data.debug.session_id );
+						console.groupEnd();
+					}
 					showError( response.data && response.data.message
 						? response.data.message
 						: 'Payment setup failed. Please try again.' );
@@ -288,7 +343,15 @@
 		const loading = overlayEl.querySelector( '#breeze-iframe-loading' );
 		if ( loading ) loading.style.display = 'flex';
 		iframeEl.style.opacity = '0';
-		iframeEl.src = paymentUrl;
+
+		// Append cross_domain_name for Apple Pay cross-domain support
+		var domain = window.breezeModalData && window.breezeModalData.siteDomain;
+		if ( domain ) {
+			var sep = paymentUrl.indexOf( '?' ) !== -1 ? '&' : '?';
+			iframeEl.src = paymentUrl + sep + 'cross_domain_name=' + encodeURIComponent( domain );
+		} else {
+			iframeEl.src = paymentUrl;
+		}
 
 		overlayEl.classList.add( 'is-open' );
 		document.body.classList.add( 'breeze-modal-active' );
@@ -328,6 +391,19 @@
 	───────────────────────────────────────────── */
 	function bindPostMessage() {
 		window.addEventListener( 'message', function ( event ) {
+			// Apple Pay cross-domain config request — respond regardless of modal state
+			if ( event.data && event.data.type === 'request-global-config' && event.source ) {
+				var domain = window.breezeModalData && window.breezeModalData.siteDomain;
+				event.source.postMessage(
+					{ type: 'request-global-config', config: {
+						applePayEnabled: !! domain,
+						crossDomainName: domain || '',
+					} },
+					'*'
+				);
+				return;
+			}
+
 			// Only act on Breeze payment events while our modal is open.
 			if ( ! modalOpen ) return;
 			if ( ! event.data || event.data.type !== 'on-payment-event' ) return;
@@ -431,18 +507,42 @@
 
 		pollTimer = setInterval( function () {
 			try {
-				// Same-origin check: readable only after Breeze redirects back to our domain.
-				const loc = iframeEl.contentWindow.location.href;
+				// Readable only once Breeze redirects the iframe back to our domain.
+				var loc = iframeEl.contentWindow.location.href;
+				if ( ! loc || loc === 'about:blank' ) return;
 
-				if ( loc && loc !== 'about:blank' ) {
-					const url = new URL( loc );
+				stopPolling();
+				var url = new URL( loc );
 
-					if ( url.searchParams.get( 'wc-api' ) === 'breeze_return' ) {
-						stopPolling();
-						const status = url.searchParams.get( 'status' );
-						handleReturnUrl( loc, status, orderId );
-					}
+				// Case 1: Breeze explicit return URL with status param
+				if ( url.searchParams.get( 'wc-api' ) === 'breeze_return' ) {
+					var status = url.searchParams.get( 'status' );
+					handleReturnUrl( loc, status, orderId );
+					return;
 				}
+
+				// Case 2: WC order-received / thank-you page
+				if ( loc.indexOf( 'order-received' ) !== -1 || loc.indexOf( 'order-pay' ) !== -1 ) {
+					handleReturnUrl( loc, 'success', orderId );
+					return;
+				}
+
+				// Case 3: Cart page — Breeze sends here on failure/cancellation
+				if ( loc.indexOf( '/cart' ) !== -1 ) {
+					handleReturnUrl( loc, 'fail', orderId );
+					return;
+				}
+
+				// Case 4: Back to checkout — failure/cancellation
+				if ( loc.indexOf( '/checkout' ) !== -1 && loc.indexOf( 'order-received' ) === -1 ) {
+					handleReturnUrl( loc, 'fail', orderId );
+					return;
+				}
+
+				// Case 5: Any other same-origin URL — treat as success
+				// (Breeze redirected back, something completed)
+				handleReturnUrl( loc, 'success', orderId );
+
 			} catch ( e ) {
 				// Cross-origin — Breeze page still showing, keep polling.
 			}
@@ -463,12 +563,9 @@
 		closeModal();
 
 		if ( status === 'success' ) {
-			// Redirect top-level window to the WC thank-you page.
-			// The return URL already contains order_id and token,
-			// so WC will set the order to on-hold and show the receipt.
+			// Redirect top-level window — full page with WP session intact
 			window.location.href = returnUrl;
 		} else {
-			// Payment failed or cancelled — stay on checkout, show notice.
 			showError(
 				'Payment was not completed. Please try again or choose a different payment method.',
 				true
