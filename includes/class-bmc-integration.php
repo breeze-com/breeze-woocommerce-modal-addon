@@ -336,38 +336,6 @@ class BMC_Integration {
 	}
 
 	/**
-	 * Returns the notice message stored in the transient for this session, or null.
-	 * Deletes the transient immediately after reading (show once).
-	 *
-	 * @return string|null
-	 */
-	private function get_payment_notice_message() {
-		$session_id = WC()->session ? WC()->session->get_customer_id() : session_id();
-		$key        = 'bmc_notice_' . $session_id;
-		$message    = get_transient( $key );
-
-		if ( $message ) {
-			delete_transient( $key );
-			return $message;
-		}
-
-		return null;
-	}
-
-	/**
-	 * Show WC error notice on shortcode checkout page.
-	 */
-	public function maybe_show_payment_failed_notice() {
-		$message = $this->get_payment_notice_message();
-		if ( ! $message ) {
-			return;
-		}
-		wc_add_notice( $message, 'error' );
-	}
-
-
-
-	/**
 	 * Intercepts the checkout page load when returning after a failed/cancelled
 	 * Breeze payment.
 	 *
